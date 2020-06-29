@@ -20,7 +20,8 @@ params=defaultdict(
     dimension_char=32,
     vocab_size=50000,
     char_vocab_size=100,
-    embedding_dropout=0.5,
+    embedding_dropout=0.3,
+    residual_dropout=0.2,
     highway_dropout=0.3
 )
 
@@ -41,27 +42,36 @@ class QANet(object):
 
 
     def forward(self,features,labels=None,mode=None):
+        c_mask=tf.sequence_mask(features["context"],maxlen=self.params["passage_length"],dtype=tf.float32)
+        q_mask=tf.sequence_mask(features["question"],maxlen=self.params["question_length"],dtype=tf.float32)
+        c_len=tf.reduce_sum(tf.cast(c_mask,tf.int32),axis=1)
+        q_len=tf.reduce_sum(tf.cast(q_mask,tf.int32),axis=1)
+
+        # embedding
         context_emb, question_emb=self.embedding(features,mode)
-        context_emb=highway(context_emb,size=self.params["dimension"],scope="highway",
-                            dropout=self.params["highway_dropout"] if mode=="train" else 0.0,
-                            reuse=None)
-        question_emb=highway(question_emb,size=self.params["dimension"],scope="highway",
-                             dropout=self.params["highway_dropout"] if mode == "train" else 0.0,
-                             reuse=True)
-        print(question_emb.shape)
+        # highway
+        context_emb, question_emb=self.highway_layer(context_emb,question_emb,mode)
+        # embedding encoder
+        c,q=self.encoder_layer(context_emb,question_emb,c_mask,q_mask,mode)
+        # C2Q and Q2C attention from BiDAF
+        print(c.shape)
+        print(q.shape)
+
+
+
+
+
+
+
+
+
 
 
 
     def embedding(self,features,mode):
         PL=self.params["passage_length"]
         QL=self.params["question_length"]
-
         dropout= self.params["embedding_dropout"] if mode=="train" else 0.0
-
-        c_mask=tf.sequence_mask(features["context"],maxlen=self.params["passage_length"],dtype=tf.float32)
-        q_mask=tf.sequence_mask(features["question"],maxlen=self.params["question_length"],dtype=tf.float32)
-        c_len=tf.reduce_sum(tf.cast(c_mask,tf.int32),axis=1)
-        q_len=tf.reduce_sum(tf.cast(q_mask,tf.int32),axis=1)
 
         with tf.variable_scope("embedding"):
             word_mat = tf.get_variable(name="word_mat",
@@ -113,6 +123,46 @@ class QANet(object):
         question_emb=tf.concat([question_emb,question_char_emb],axis=-1)
 
         return context_emb,question_emb
+
+
+    def highway_layer(self,c_emb,q_emb,mode):
+        context_emb = highway(c_emb,
+                              size=self.params["dimension"],
+                              scope="highway",
+                              dropout=self.params["highway_dropout"] if mode == "train" else 0.0,
+                              reuse=None)
+        question_emb = highway(q_emb,
+                               size=self.params["dimension"],
+                               scope="highway",
+                               dropout=self.params["highway_dropout"] if mode == "train" else 0.0,
+                               reuse=True)
+        return context_emb,question_emb
+
+
+    def encoder_layer(self,c_emb,q_emb,c_mask,q_mask,mode):
+        with tf.variable_scope("embedding_encoder_layer"):
+            c=residual_block(c_emb,
+                             num_blocks=1,
+                             num_conv_layers=4,
+                             kernel_size=7,
+                             mask=c_mask,
+                             num_filters=self.params["dimension"],
+                             num_heads=self.params["num_heads"],
+                             scope="encoder_residual_block",
+                             bias=False,
+                             dropout=self.params["residual_dropout"] if mode=="train" else 0.0)
+            q=residual_block(q_emb,
+                             num_blocks=1,
+                             num_conv_layers=4,
+                             kernel_size=7,
+                             mask=q_mask,
+                             num_filters=self.params["dimension"],
+                             num_heads=self.params["num_heads"],
+                             scope="encoder_residual_block",
+                             bias=False,
+                             dropout=self.params["residual_dropout"] if mode == "train" else 0.0,
+                             reuse=True) # q和c使用相同的网络参数
+            return c,q
 
 
 
