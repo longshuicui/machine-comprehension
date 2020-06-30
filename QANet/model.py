@@ -22,6 +22,8 @@ params=defaultdict(
     char_vocab_size=100,
     embedding_dropout=0.3,
     residual_dropout=0.2,
+    attention_dropout=0.2,
+    encoder_dropout=0.2,
     highway_dropout=0.3
 )
 
@@ -42,20 +44,32 @@ class QANet(object):
 
 
     def forward(self,features,labels=None,mode=None):
-        c_mask=tf.sequence_mask(features["context"],maxlen=self.params["passage_length"],dtype=tf.float32)
-        q_mask=tf.sequence_mask(features["question"],maxlen=self.params["question_length"],dtype=tf.float32)
-        c_len=tf.reduce_sum(tf.cast(c_mask,tf.int32),axis=1)
-        q_len=tf.reduce_sum(tf.cast(q_mask,tf.int32),axis=1)
+        if mode!=tf.estimator.ModeKeys.TRAIN:
+            self.params["embedding_dropout"]=0.0
+            self.params["residual_dropout"]=0.0
+            self.params["attention_dropout"]=0.0
+            self.params["encoder_dropout"]=0.0
 
+        c_mask=tf.cast(tf.cast(features["context"],tf.bool),tf.float32)
+        q_mask=tf.cast(tf.cast(features["question"],tf.bool),tf.float32)
         # embedding
-        context_emb, question_emb=self.embedding(features,mode)
+        context_emb, question_emb=self.embedding(features)
         # highway
-        context_emb, question_emb=self.highway_layer(context_emb,question_emb,mode)
+        context_emb, question_emb=self.highway_layer(context_emb,question_emb)
         # embedding encoder
-        c,q=self.encoder_layer(context_emb,question_emb,c_mask,q_mask,mode)
+        c,q=self.encoder_layer(context_emb,question_emb,c_mask,q_mask)
         # C2Q and Q2C attention from BiDAF
-        print(c.shape)
-        print(q.shape)
+        attention_outputs=self.context_to_query_attention_layer(c,q,c_mask,q_mask)
+        # model encoder
+        outputs=self.model_encoder_layer(attention_outputs,c_mask)
+        # logits
+        start_logits, end_logits=self.output_layer(outputs,c_mask)
+        if mode==tf.estimator.ModeKeys.PREDICT:
+            return start_logits,end_logits
+        loss1 = tf.nn.softmax_cross_entropy_with_logits(logits=start_logits, labels=features["y1"])
+        loss2 = tf.nn.softmax_cross_entropy_with_logits(logits=end_logits, labels=features["y2"])
+        loss = tf.reduce_mean(loss1 + loss2)
+        return start_logits, end_logits, loss
 
 
 
@@ -63,15 +77,9 @@ class QANet(object):
 
 
 
-
-
-
-
-
-    def embedding(self,features,mode):
+    def embedding(self,features):
         PL=self.params["passage_length"]
         QL=self.params["question_length"]
-        dropout= self.params["embedding_dropout"] if mode=="train" else 0.0
 
         with tf.variable_scope("embedding"):
             word_mat = tf.get_variable(name="word_mat",
@@ -90,8 +98,8 @@ class QANet(object):
                                      shape=[-1, self.params["character_limit"],self.params["dimension_char"]])
 
         # dropout
-        context_char_emb=tf.nn.dropout(context_char_emb,keep_prob=1.0-dropout)
-        question_char_emb=tf.nn.dropout(question_char_emb,keep_prob=1.0-dropout)
+        context_char_emb=tf.nn.dropout(context_char_emb,keep_prob=1.0-self.params["embedding_dropout"])
+        question_char_emb=tf.nn.dropout(question_char_emb,keep_prob=1.0-self.params["embedding_dropout"])
 
         # put char embedding through a cnn, concat representations
         context_char_emb=conv(inputs=context_char_emb,
@@ -116,8 +124,8 @@ class QANet(object):
         context_emb=tf.nn.embedding_lookup(word_mat,features["context"])
         question_emb=tf.nn.embedding_lookup(word_mat,features["question"])
 
-        context_emb=tf.nn.dropout(context_emb, keep_prob=1.0-dropout)
-        question_emb=tf.nn.dropout(question_emb, keep_prob=1.0-dropout)
+        context_emb=tf.nn.dropout(context_emb, keep_prob=1.0-self.params["embedding_dropout"])
+        question_emb=tf.nn.dropout(question_emb, keep_prob=1.0-self.params["embedding_dropout"])
 
         context_emb=tf.concat([context_emb,context_char_emb],axis=-1)
         question_emb=tf.concat([question_emb,question_char_emb],axis=-1)
@@ -125,21 +133,21 @@ class QANet(object):
         return context_emb,question_emb
 
 
-    def highway_layer(self,c_emb,q_emb,mode):
+    def highway_layer(self,c_emb,q_emb):
         context_emb = highway(c_emb,
                               size=self.params["dimension"],
                               scope="highway",
-                              dropout=self.params["highway_dropout"] if mode == "train" else 0.0,
+                              dropout=self.params["highway_dropout"],
                               reuse=None)
         question_emb = highway(q_emb,
                                size=self.params["dimension"],
                                scope="highway",
-                               dropout=self.params["highway_dropout"] if mode == "train" else 0.0,
+                               dropout=self.params["highway_dropout"],
                                reuse=True)
         return context_emb,question_emb
 
 
-    def encoder_layer(self,c_emb,q_emb,c_mask,q_mask,mode):
+    def encoder_layer(self,c_emb,q_emb,c_mask,q_mask):
         with tf.variable_scope("embedding_encoder_layer"):
             c=residual_block(c_emb,
                              num_blocks=1,
@@ -150,7 +158,7 @@ class QANet(object):
                              num_heads=self.params["num_heads"],
                              scope="encoder_residual_block",
                              bias=False,
-                             dropout=self.params["residual_dropout"] if mode=="train" else 0.0)
+                             dropout=self.params["residual_dropout"])
             q=residual_block(q_emb,
                              num_blocks=1,
                              num_conv_layers=4,
@@ -160,9 +168,61 @@ class QANet(object):
                              num_heads=self.params["num_heads"],
                              scope="encoder_residual_block",
                              bias=False,
-                             dropout=self.params["residual_dropout"] if mode == "train" else 0.0,
+                             dropout=self.params["residual_dropout"],
                              reuse=True) # q和c使用相同的网络参数
             return c,q
+
+
+    def context_to_query_attention_layer(self,c,q,c_mask,q_mask):
+        with tf.variable_scope("context_to_query_attention_layer"):
+            S=optimized_trilinear_for_attention([c,q],
+                                                c_maxlen=self.params["passage_length"],
+                                                q_maxlen=self.params["question_length"],
+                                                input_keep_prob=1.0-self.params["attention_dropout"])
+            mask_q=tf.expand_dims(q_mask,1)
+            S_=tf.nn.softmax(mask_logits(S,mask=mask_q))
+            mask_c=tf.expand_dims(c_mask,2)
+            S_T=tf.transpose(tf.nn.softmax(mask_logits(S,mask=mask_c),dim=1),[0,2,1])
+            c2q=tf.matmul(S_,q)
+            q2c=tf.matmul(tf.matmul(S_,S_T),c)
+            attention_outputs=tf.concat([c,c2q,c*c2q,c*q2c],axis=-1)
+            return attention_outputs
+
+
+    def model_encoder_layer(self,inputs,c_mask):
+        outputs=[conv(inputs,self.params["dimension"],name="input_projection")]
+        for i in range(3):
+            if i%2 == 0:
+                outputs[i]=tf.nn.dropout(outputs[i],keep_prob=1.0-self.params["encoder_dropout"])
+            output=residual_block(outputs[i],
+                                  num_blocks=7,
+                                  num_conv_layers=2,
+                                  kernel_size=5,
+                                  mask=c_mask,
+                                  num_filters=self.params["dimension"],
+                                  num_heads=self.params["num_heads"],
+                                  scope="model_encoder",
+                                  reuse=True if i>0 else None,
+                                  bias=False,
+                                  dropout=self.params["residual_dropout"])
+            outputs.append(output)
+        return outputs
+
+
+    def output_layer(self,model_enc,c_mask):
+        with tf.variable_scope("output_layer"):
+            # start index
+            s_inp=tf.concat([model_enc[1],model_enc[2]],axis=-1)
+            start_logits=conv(s_inp,1,bias=False,name="start_pointer")
+            start_logits=tf.squeeze(start_logits,axis=-1)
+            start_logits=mask_logits(start_logits,mask=c_mask)
+            # end index
+            e_inp=tf.concat([model_enc[1],model_enc[3]],axis=-1)
+            end_logits=conv(e_inp,1,bias=False,name="end_pointer")
+            end_logits=tf.squeeze(end_logits,axis=-1)
+            end_logits=mask_logits(end_logits,mask=c_mask)
+
+            return start_logits, end_logits
 
 
 
