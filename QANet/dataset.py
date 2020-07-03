@@ -105,5 +105,6 @@ if __name__ == '__main__':
     word_counter=Counter()
     char_counter=Counter()
     train_examples,train_eval=process_file("../data/train.json","train",word_counter,char_counter)
+    # shengcheng
     word2index=load_vocab_file(word_counter)
     char2index=load_vocab_file(char_counter)
