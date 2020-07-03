@@ -24,7 +24,9 @@ params=defaultdict(
     residual_dropout=0.2,
     attention_dropout=0.2,
     encoder_dropout=0.2,
-    highway_dropout=0.3
+    highway_dropout=0.3,
+    learning_rate=0.01,
+    max_gradient=5.0
 )
 
 class QANet(object):
@@ -70,11 +72,6 @@ class QANet(object):
         loss2 = tf.nn.softmax_cross_entropy_with_logits(logits=end_logits, labels=features["y2"])
         loss = tf.reduce_mean(loss1 + loss2)
         return start_logits, end_logits, loss
-
-
-
-
-
 
 
     def embedding(self,features):
@@ -225,8 +222,15 @@ class QANet(object):
             return start_logits, end_logits
 
 
-
-
+def create_train_op(loss,params):
+    global_step=tf.train.get_or_create_global_step()
+    lr=tf.minimum(params["learning_rate"],0.001/tf.log(999.)*tf.log(tf.cast(global_step,tf.float32)+1))
+    optimizer=tf.train.AdamOptimizer(learning_rate=lr,beta1=0.8,beta2=0.999)
+    grads=optimizer.compute_gradients(loss)
+    gradients,variables=zip(*grads)
+    clip_grads,_=tf.clip_by_global_norm(gradients,params["max_gradient"])
+    train_op=optimizer.apply_gradients(zip(clip_grads,variables),global_step=global_step)
+    return train_op,global_step
 
 
 
@@ -243,4 +247,8 @@ if __name__ == '__main__':
               "y1":y1,
               "y2":y2}
     model.forward(features)
+
+    variables=tf.trainable_variables()
+    for name,var in variables:
+        print(name)
 
